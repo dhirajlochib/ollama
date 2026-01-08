@@ -690,6 +690,10 @@ type CreateRequest struct {
 	// Requires is the minimum version of Ollama required by the model.
 	Requires string `json:"requires,omitempty"`
 
+	// Draft is the name of a smaller draft model used for speculative decoding.
+	// The draft model must have the same tokenizer/family as the main model.
+	Draft string `json:"draft,omitempty"`
+
 	// Info is a map of additional information for the model
 	Info map[string]any `json:"info,omitempty"`
 

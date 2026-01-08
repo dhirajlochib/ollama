@@ -21,6 +21,7 @@ A Modelfile is the blueprint to create and share customized models using Ollama.
   - [ADAPTER](#adapter)
   - [LICENSE](#license)
   - [MESSAGE](#message)
+  - [DRAFT](#draft)
 - [Notes](#notes)
 
 ## Format
@@ -41,6 +42,7 @@ INSTRUCTION arguments
 | [`ADAPTER`](#adapter)               | Defines the (Q)LoRA adapters to apply to the model.            |
 | [`LICENSE`](#license)               | Specifies the legal license.                                   |
 | [`MESSAGE`](#message)               | Specify message history.                                       |
+| [`DRAFT`](#draft)                   | Specifies a draft model for speculative decoding.              |
 | [`REQUIRES`](#requires)             | Specify the minimum version of Ollama required by the model.   |
 
 ## Examples
@@ -248,6 +250,28 @@ MESSAGE assistant no
 MESSAGE user Is Ontario in Canada?
 MESSAGE assistant yes
 ```
+
+### DRAFT
+
+The `DRAFT` instruction allows you to specify a smaller draft model for speculative decoding. Speculative decoding uses a smaller, faster model to predict tokens that are then verified by the main model, potentially providing 2-4x speedup for inference.
+
+```
+DRAFT <model name>
+```
+
+The draft model must have the same tokenizer and model family as the main model. For example:
+
+```
+FROM qwen2.5:32b
+DRAFT qwen2.5:0.5b
+```
+
+This creates a model that uses `qwen2.5:32b` as the main model and `qwen2.5:0.5b` for speculative decoding. The result is the full quality of the 32b model with significantly faster inference.
+
+> **Note**: Speculative decoding is most effective when:
+> - The draft model is much smaller than the main model (e.g., 0.5b drafting for 32b)
+> - Both models share the same tokenizer/vocabulary
+> - The task doesn't require highly creative or diverse outputs
 
 ### REQUIRES
 

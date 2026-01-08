@@ -228,6 +228,20 @@ PARSER parser1
 	assert.Equal(t, []Command{{Name: "model", Args: "foo"}, {Name: "parser", Args: "parser1"}}, modelfile.Commands)
 }
 
+func TestParseFileDraft(t *testing.T) {
+	input := `
+FROM qwen2.5:32b
+DRAFT qwen2.5:0.5b
+`
+
+	reader := strings.NewReader(input)
+
+	modelfile, err := ParseFile(reader)
+	require.NoError(t, err)
+
+	assert.Equal(t, []Command{{Name: "model", Args: "qwen2.5:32b"}, {Name: "draft", Args: "qwen2.5:0.5b"}}, modelfile.Commands)
+}
+
 func TestParseFileMessages(t *testing.T) {
 	cases := []struct {
 		input    string
@@ -754,6 +768,15 @@ MESSAGE assistant Hi! How are you?
 					{Role: "user", Content: "Hello there!"},
 					{Role: "assistant", Content: "Hi! How are you?"},
 				},
+			},
+		},
+		{
+			`FROM qwen2.5:32b
+DRAFT qwen2.5:0.5b
+`,
+			&api.CreateRequest{
+				From:  "qwen2.5:32b",
+				Draft: "qwen2.5:0.5b",
 			},
 		},
 	}

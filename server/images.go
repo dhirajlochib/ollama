@@ -65,6 +65,7 @@ type Model struct {
 	Digest         string
 	Options        map[string]any
 	Messages       []api.Message
+	Draft          string // Draft model name for speculative decoding
 
 	Template *template.Template
 }
@@ -317,6 +318,9 @@ func GetModel(name string) (*Model, error) {
 		if err := json.NewDecoder(configFile).Decode(&model.Config); err != nil {
 			return nil, err
 		}
+
+		// Set draft model from config
+		model.Draft = model.Config.Draft
 	}
 
 	for _, layer := range manifest.Layers {
