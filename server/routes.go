@@ -44,6 +44,7 @@ import (
 	"github.com/ollama/ollama/model/renderers"
 	"github.com/ollama/ollama/server/internal/client/ollama"
 	"github.com/ollama/ollama/server/internal/registry"
+	"github.com/ollama/ollama/speculative"
 	"github.com/ollama/ollama/template"
 	"github.com/ollama/ollama/thinking"
 	"github.com/ollama/ollama/tools"
@@ -202,6 +203,30 @@ func (s *Server) getDraftRunner(draftName string) llm.LlamaServer {
 	}
 
 	return s.sched.GetLoadedRunner(draftModel.ModelPath)
+}
+
+// getSpeculativeEngine creates a speculative decoding engine if draft model is available
+func (s *Server) getSpeculativeEngine(targetRunner llm.LlamaServer, draftName string) *speculative.Engine {
+	if draftName == "" {
+		return nil
+	}
+
+	draftRunner := s.getDraftRunner(draftName)
+	if draftRunner == nil {
+		slog.Debug("draft model not yet loaded for speculative decoding", "draft", draftName)
+		return nil
+	}
+
+	config := speculative.ConfigFromModel(draftName)
+	engine := speculative.NewEngine(config)
+	engine.SetDraftServer(draftRunner)
+	engine.SetTargetServer(targetRunner)
+
+	slog.Info("speculative decoding engine ready",
+		"draft_model", draftName,
+		"num_speculative_tokens", config.NumSpeculativeTokens)
+
+	return engine
 }
 
 func signinURL() (string, error) {
@@ -554,7 +579,12 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		// TODO (jmorganca): avoid building the response twice both here and below
 		var sb strings.Builder
 		defer close(ch)
-		if err := r.Completion(c.Request.Context(), llm.CompletionRequest{
+
+		// Check if speculative decoding is available for this model
+		specEngine := s.getSpeculativeEngine(r, m.Draft)
+		var completionErr error
+
+		completionReq := llm.CompletionRequest{
 			Prompt:      prompt,
 			Images:      images,
 			Format:      req.Format,
@@ -563,7 +593,9 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 			Truncate:    req.Truncate == nil || *req.Truncate,
 			Logprobs:    req.Logprobs,
 			TopLogprobs: req.TopLogprobs,
-		}, func(cr llm.CompletionResponse) {
+		}
+
+		completionFn := func(cr llm.CompletionResponse) {
 			res := api.GenerateResponse{
 				Model:     req.Model,
 				CreatedAt: time.Now().UTC(),
@@ -624,12 +656,25 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 			}
 
 			ch <- res
-		}); err != nil {
+		}
+
+		// Use speculative decoding if engine is ready, otherwise fall back to normal completion
+		if specEngine != nil && specEngine.IsReady() {
+			slog.Info("using speculative decoding for completion", "draft", m.Draft)
+			completionErr = specEngine.SpeculativeCompletion(c.Request.Context(), completionReq, completionFn)
+		} else {
+			if m.Draft != "" {
+				slog.Debug("draft model not ready, using normal completion", "draft", m.Draft)
+			}
+			completionErr = r.Completion(c.Request.Context(), completionReq, completionFn)
+		}
+
+		if completionErr != nil {
 			var serr api.StatusError
-			if errors.As(err, &serr) {
+			if errors.As(completionErr, &serr) {
 				ch <- gin.H{"error": serr.ErrorMessage, "status": serr.StatusCode}
 			} else {
-				ch <- gin.H{"error": err.Error()}
+				ch <- gin.H{"error": completionErr.Error()}
 			}
 		}
 	}()
