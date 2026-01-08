@@ -159,7 +159,49 @@ func (s *Server) scheduleRunner(ctx context.Context, name string, caps []model.C
 		return nil, nil, nil, err
 	}
 
+	// If the model has a draft model configured, try to load it as well for speculative decoding
+	if model.Draft != "" {
+		go s.loadDraftModel(ctx, model.Draft, keepAlive)
+	}
+
 	return runner.llama, model, &opts, nil
+}
+
+// loadDraftModel asynchronously loads the draft model for speculative decoding
+// This runs in the background so it doesn't block the main model from being used
+func (s *Server) loadDraftModel(ctx context.Context, draftName string, keepAlive *api.Duration) {
+	draftModel, err := GetModel(draftName)
+	if err != nil {
+		slog.Warn("failed to get draft model for speculative decoding", "draft", draftName, "error", err)
+		return
+	}
+
+	opts := api.DefaultOptions()
+	opts.NumCtx = 2048 // Draft models typically need less context
+
+	runnerCh, errCh := s.sched.GetRunner(ctx, draftModel, opts, keepAlive)
+	select {
+	case <-runnerCh:
+		slog.Info("draft model loaded for speculative decoding", "draft", draftName)
+	case err = <-errCh:
+		slog.Warn("failed to load draft model for speculative decoding", "draft", draftName, "error", err)
+	case <-ctx.Done():
+		slog.Debug("context cancelled while loading draft model", "draft", draftName)
+	}
+}
+
+// getDraftRunner returns the draft model runner if available for speculative decoding
+func (s *Server) getDraftRunner(draftName string) llm.LlamaServer {
+	if draftName == "" {
+		return nil
+	}
+
+	draftModel, err := GetModel(draftName)
+	if err != nil {
+		return nil
+	}
+
+	return s.sched.GetLoadedRunner(draftModel.ModelPath)
 }
 
 func signinURL() (string, error) {

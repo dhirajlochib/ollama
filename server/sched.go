@@ -80,6 +80,28 @@ func InitScheduler(ctx context.Context) *Scheduler {
 	return sched
 }
 
+// GetLoadedRunner returns a loaded runner by model path if it exists and is ready
+// This is useful for speculative decoding to get the draft model runner
+func (s *Scheduler) GetLoadedRunner(modelPath string) llm.LlamaServer {
+	s.loadedMu.Lock()
+	runner := s.loaded[modelPath]
+	s.loadedMu.Unlock()
+
+	if runner == nil {
+		return nil
+	}
+
+	runner.refMu.Lock()
+	defer runner.refMu.Unlock()
+
+	// Only return if not still loading
+	if runner.loading {
+		return nil
+	}
+
+	return runner.llama
+}
+
 // context must be canceled to decrement ref count and release the runner
 func (s *Scheduler) GetRunner(c context.Context, m *Model, opts api.Options, sessionDuration *api.Duration) (chan *runnerRef, chan error) {
 	if opts.NumCtx < 4 {
