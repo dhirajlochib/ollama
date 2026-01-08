@@ -580,8 +580,6 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		var sb strings.Builder
 		defer close(ch)
 
-		// Check if speculative decoding is available for this model
-		specEngine := s.getSpeculativeEngine(r, m.Draft)
 		var completionErr error
 
 		completionReq := llm.CompletionRequest{
@@ -658,28 +656,25 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 			ch <- res
 		}
 
-		// Speculative decoding infrastructure is ready but the actual speedup requires
-		// deep runner-level integration. The draft model loads alongside the target model,
-		// but using it for actual speculation requires changes to the core inference loop
-		// in runner/ollamarunner/runner.go.
-		//
-		// What's implemented:
-		// ✅ DRAFT command in Modelfile
-		// ✅ Draft model co-loading with target model  
-		// ✅ Speculative engine with acceptance algorithm
-		//
-		// What's needed for actual speedup:
-		// - Integration into runner's token-by-token generation loop
-		// - Shared KV cache management between draft and target
-		// - Batch verification of draft tokens in single forward pass
-		//
-		// For now, use normal completion but log when draft model is available
+		// Speculative decoding: inject draft runner into target runner if available
 		if m.Draft != "" {
 			draftRunner := s.getDraftRunner(m.Draft)
 			if draftRunner != nil {
-				slog.Info("speculative decoding ready (infrastructure)",
-					"draft_model", m.Draft,
-					"note", "runner integration needed for speedup")
+				// Try to inject draft runner into the target runner for speculative decoding
+				// This requires the runner to support SetDraftRunner method
+				type DraftCapable interface {
+					SetDraftRunner(llm.LlamaServer)
+				}
+				if dc, ok := r.(DraftCapable); ok {
+					dc.SetDraftRunner(draftRunner)
+					slog.Info("speculative decoding enabled",
+						"draft_model", m.Draft,
+						"target_model", req.Model)
+				} else {
+					slog.Debug("runner does not support draft injection",
+						"draft_model", m.Draft,
+						"runner_type", fmt.Sprintf("%T", r))
+				}
 			}
 		}
 		

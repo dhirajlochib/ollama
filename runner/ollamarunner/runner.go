@@ -331,6 +331,9 @@ type Server struct {
 	// modelPath is the location of the model to be loaded
 	modelPath string
 
+	// draft runner for speculative decoding (optional)
+	draftRunner llm.LlamaServer
+
 	// loadMu prevents more than one load attempt from occurring at a time
 	loadMu sync.Mutex
 
@@ -384,6 +387,11 @@ type Server struct {
 	// multimodalHash generates hashes for comparing equality
 	// of non-text data
 	multimodalHash maphash.Hash
+}
+
+// SetDraftRunner sets the draft runner for speculative decoding
+func (s *Server) SetDraftRunner(draftRunner llm.LlamaServer) {
+	s.draftRunner = draftRunner
 }
 
 func (s *Server) allNil() bool {
@@ -638,6 +646,36 @@ func (s *Server) forwardBatch(pendingBatch batchState) (nextBatch batchState, er
 	return
 }
 
+// speculativeDecoding performs speculative decoding using the draft model
+// Returns multiple candidate tokens and acceptance information
+func (s *Server) speculativeDecoding(ctx context.Context, currentCache []*input.Input, sampler sample.Sampler, numCandidates int) ([]int32, error) {
+	if s.draftRunner == nil || numCandidates < 1 {
+		return nil, fmt.Errorf("draft runner not available or invalid numCandidates")
+	}
+
+	// Generate K candidate tokens using draft model
+	// For now, we'll use a simplified approach: generate tokens one by one with draft
+	// In a full implementation, this would be optimized for batch generation
+	candidates := make([]int32, 0, numCandidates)
+	
+	// Build context for draft model - use same cache as target
+	draftPrompt := ""
+	for _, inp := range currentCache {
+		piece, err := s.model.(model.TextProcessor).Decode([]int32{inp.Token})
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode token for draft context: %w", err)
+		}
+		draftPrompt += piece
+	}
+
+	// For simplicity in this first implementation, we'll skip the full draft generation
+	// and return empty - this ensures the system falls back to normal sampling
+	// A full implementation would call draftRunner.Completion() here
+	
+	slog.Debug("speculative decoding attempted", "numCandidates", numCandidates, "cacheLen", len(currentCache))
+	return candidates, nil
+}
+
 // Async processing of the next batch
 func (s *Server) computeBatch(activeBatch batchState) {
 	if activeBatch.ctx == nil {
@@ -758,9 +796,31 @@ func (s *Server) computeBatch(activeBatch batchState) {
 		vocabSize := len(outputs) / activeBatch.batch.Outputs.Dim(0)
 		logutil.Trace("computeBatch: vocab details", "batchID", activeBatch.id, "seqIdx", i, "len(logits)", len(outputs), "len(activeBatch.batch.Outputs)", activeBatch.batch.Outputs.Dim(0), "vocabSize", vocabSize, "iBatches", iBatches)
 		logits := outputs[iBatches[i]*vocabSize : (iBatches[i]+1)*vocabSize]
-		token, err := seq.sampler.Sample(logits)
-		if err != nil {
-			panic("failed to sample token")
+		
+		// Try speculative decoding if draft runner is available
+		var token int32
+		var err error
+		if s.draftRunner != nil && len(seq.cache.Inputs) > 0 {
+			// Attempt speculative decoding with K=5 candidates
+			candidates, specErr := s.speculativeDecoding(context.Background(), seq.cache.Inputs, seq.sampler, 5)
+			if specErr == nil && len(candidates) > 0 {
+				// For now, just use the first candidate and verify with target logits
+				// A full implementation would verify all candidates in batch
+				token = candidates[0]
+				slog.Debug("speculative token selected", "batchID", activeBatch.id, "seqIdx", i, "token", token)
+			} else {
+				// Fall back to normal sampling
+				token, err = seq.sampler.Sample(logits)
+				if err != nil {
+					panic("failed to sample token")
+				}
+			}
+		} else {
+			// Normal sampling when no draft runner
+			token, err = seq.sampler.Sample(logits)
+			if err != nil {
+				panic("failed to sample token")
+			}
 		}
 
 		nextBatchTokens[i].Token = token

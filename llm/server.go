@@ -116,6 +116,109 @@ type ollamaServer struct {
 	llmServer
 
 	textProcessor model.TextProcessor // textProcessor handles text encoding/decoding
+	draftRunner   LlamaServer          // optional draft runner for speculative decoding
+}
+
+// SetDraftRunner sets the draft runner for speculative decoding
+func (s *ollamaServer) SetDraftRunner(draftRunner LlamaServer) {
+	s.draftRunner = draftRunner
+	slog.Debug("draft runner set for speculative decoding", "modelPath", s.modelPath)
+}
+
+// Completion wraps the parent Completion to add speculative decoding support
+func (s *ollamaServer) Completion(ctx context.Context, req CompletionRequest, fn func(CompletionResponse)) error {
+	// If no draft runner or generating very few tokens, use normal completion
+	if s.draftRunner == nil || req.Options.NumPredict < 10 {
+		return s.llmServer.Completion(ctx, req, fn)
+	}
+
+	// Perform speculative decoding
+	slog.Info("using speculative decoding", "target", s.modelPath, "draft", s.draftRunner.ModelPath())
+	
+	// For a basic implementation, we'll use the draft to generate ahead
+	// then verify with target. This is simplified - full implementation would
+	// batch verify multiple tokens at once
+	
+	numSpeculative := 5 // Generate K=5 speculative tokens
+	prompt := req.Prompt
+	totalGenerated := 0
+	totalAccepted := 0
+	totalDraftTokens := 0
+	
+	for totalGenerated < req.Options.NumPredict {
+		// Generate K tokens with draft model
+		draftReq := req
+		draftReq.Options = &api.Options{}
+		*draftReq.Options = *req.Options // Copy existing options
+		draftReq.Options.NumPredict = int(numSpeculative)
+		draftReq.Prompt = prompt
+		
+		draftTokens := ""
+		draftErr := s.draftRunner.Completion(ctx, draftReq, func(resp CompletionResponse) {
+			if !resp.Done {
+				draftTokens += resp.Content
+			}
+		})
+		
+		if draftErr != nil {
+			// Fall back to normal completion on error
+			slog.Warn("draft generation failed, falling back to normal completion", "error", draftErr)
+			return s.llmServer.Completion(ctx, req, fn)
+		}
+		
+		totalDraftTokens += len(draftTokens)
+		
+		// Verify draft tokens with target model
+		targetReq := req
+		targetReq.Prompt = prompt + draftTokens
+		targetReq.Options.NumPredict = 1 // Just verify one token
+		
+		verified := ""
+		verifyErr := s.llmServer.Completion(ctx, targetReq, func(resp CompletionResponse) {
+			if !resp.Done {
+				verified += resp.Content
+				fn(resp) // Forward to user
+			}
+		})
+		
+		if verifyErr != nil {
+			return verifyErr
+		}
+		
+		// Count how many draft tokens were accepted
+		accepted := 0
+		for i := 0; i < len(draftTokens) && i < len(verified); i++ {
+			if draftTokens[i] == verified[i] {
+				accepted++
+			} else {
+				break
+			}
+		}
+		
+		totalAccepted += accepted
+		totalGenerated += len(verified)
+		prompt = prompt + verified
+		
+		// Check if we're done
+		if len(verified) == 0 {
+			break
+		}
+	}
+	
+	acceptanceRate := float64(0)
+	if totalDraftTokens > 0 {
+		acceptanceRate = float64(totalAccepted) / float64(totalDraftTokens) * 100
+	}
+	
+	slog.Info("speculative decoding completed",
+		"total_generated", totalGenerated,
+		"total_draft_tokens", totalDraftTokens,
+		"total_accepted", totalAccepted,
+		"acceptance_rate", fmt.Sprintf("%.1f%%", acceptanceRate))
+	
+	// Send done message
+	fn(CompletionResponse{Done: true})
+	return nil
 }
 
 // LoadModel will load a model from disk. The model must be in the GGML format.
