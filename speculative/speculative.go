@@ -16,10 +16,10 @@ package speculative
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"math"
 	"math/rand"
-	"strings"
 	"sync"
 	"time"
 
@@ -357,7 +357,6 @@ func (e *Engine) Speculate(ctx context.Context, prompt string) (*SpeculativeResu
 
 // SpeculativeCompletion performs completion with speculative decoding
 // This wraps the target model's completion with draft-assisted speculation
-// It returns a callback that can be used like regular Completion
 func (e *Engine) SpeculativeCompletion(ctx context.Context, req llm.CompletionRequest, fn func(llm.CompletionResponse)) error {
 	if !e.IsReady() {
 		// Fall back to normal completion if speculative decoding isn't ready
@@ -371,174 +370,190 @@ func (e *Engine) SpeculativeCompletion(ctx context.Context, req llm.CompletionRe
 		return nil
 	}
 
-	slog.Info("starting speculative decoding completion",
+	slog.Info("starting speculative decoding",
 		"draft_model", e.config.DraftModelName,
 		"num_speculative_tokens", e.config.NumSpeculativeTokens)
 
 	startTime := time.Now()
-	var totalDraft, totalAccepted int64
-	var currentPrompt strings.Builder
-	currentPrompt.WriteString(req.Prompt)
-
-	// Create modified options for draft model (greedy, fast)
-	draftOpts := api.DefaultOptions()
-	draftOpts.Temperature = 0
-	draftOpts.NumPredict = 1
-
+	var totalDraft, totalAccepted, totalGenerated int64
+	
 	e.mu.Lock()
 	draft := e.draftServer
 	target := e.targetServer
 	numSpec := e.config.NumSpeculativeTokens
 	e.mu.Unlock()
 
+	// Build current prompt incrementally
+	currentPrompt := req.Prompt
+	numPredict := req.Options.NumPredict
+	if numPredict < 0 {
+		numPredict = 512 // default
+	}
+
 	// Main speculative decoding loop
-	for {
+	for totalGenerated < int64(numPredict) {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
 
-		// Step 1: Generate draft tokens
-		draftTokens := make([]string, 0, numSpec)
-		draftLogprobs := make([]float64, 0, numSpec)
-		draftPrompt := currentPrompt.String()
+		// Step 1: Generate K draft tokens quickly with draft model
+		draftOpts := *req.Options
+		draftOpts.Temperature = 0.0 // Greedy for draft
+		draftOpts.NumPredict = numSpec
+		
+		var draftTokens []string
+		var draftLogprobs []float64
+		var draftErr error
 
-		for i := 0; i < numSpec; i++ {
-			var draftContent string
-			var draftLogprob float64
-			var done bool
-
-			err := draft.Completion(ctx, llm.CompletionRequest{
-				Prompt:      draftPrompt,
-				Options:     &draftOpts,
-				Logprobs:    true,
-				TopLogprobs: 1,
-			}, func(resp llm.CompletionResponse) {
-				draftContent = resp.Content
-				done = resp.Done
-				if len(resp.Logprobs) > 0 {
-					draftLogprob = resp.Logprobs[0].Logprob
-				}
-			})
-
-			if err != nil || done || draftContent == "" {
-				break
+		err := draft.Completion(ctx, llm.CompletionRequest{
+			Prompt:      currentPrompt,
+			Images:      req.Images,
+			Format:      req.Format,
+			Options:     &draftOpts,
+			Logprobs:    true,
+			TopLogprobs: 1,
+		}, func(resp llm.CompletionResponse) {
+			if resp.Done {
+				return
 			}
+			if len(resp.Content) > 0 {
+				draftTokens = append(draftTokens, resp.Content)
+				if len(resp.Logprobs) > 0 {
+					draftLogprobs = append(draftLogprobs, resp.Logprobs[0].Logprob)
+				}
+			}
+		})
 
-			draftTokens = append(draftTokens, draftContent)
-			draftLogprobs = append(draftLogprobs, draftLogprob)
-			draftPrompt += draftContent
+		if err != nil {
+			draftErr = err
 		}
 
-		if len(draftTokens) == 0 {
-			// No draft tokens, run target directly
-			break
+		// If draft failed or produced no tokens, fall back to target
+		if draftErr != nil || len(draftTokens) == 0 {
+			slog.Debug("draft generation failed or empty, using target only", "error", draftErr)
+			return target.Completion(ctx, req, fn)
 		}
 
 		totalDraft += int64(len(draftTokens))
 
-		// Step 2: Verify with target model (batch verification)
-		// Build verification prompt with all draft tokens
-		verifyPrompt := currentPrompt.String()
-		for _, dt := range draftTokens {
-			verifyPrompt += dt
-		}
-
+		// Step 2: Verify all draft tokens in parallel with target model
+		// Target generates from the current prompt and should produce tokens that match or correct the draft
+		verifyOpts := *req.Options
+		verifyOpts.NumPredict = len(draftTokens) + 1 // Verify K tokens + 1 more
+		
+		var targetTokens []string
 		var targetLogprobs []llm.Logprob
-		var targetContent string
 		var targetDone bool
 
-		verifyOpts := *req.Options
-		verifyOpts.NumPredict = len(draftTokens) + 1
-
-		err := target.Completion(ctx, llm.CompletionRequest{
-			Prompt:      currentPrompt.String(),
+		err = target.Completion(ctx, llm.CompletionRequest{
+			Prompt:      currentPrompt,
 			Images:      req.Images,
 			Format:      req.Format,
 			Options:     &verifyOpts,
 			Logprobs:    true,
 			TopLogprobs: 5,
 		}, func(resp llm.CompletionResponse) {
-			targetLogprobs = append(targetLogprobs, resp.Logprobs...)
-			targetContent += resp.Content
-			targetDone = resp.Done
+			if resp.Done {
+				targetDone = true
+				return
+			}
+			if len(resp.Content) > 0 {
+				targetTokens = append(targetTokens, resp.Content)
+				targetLogprobs = append(targetLogprobs, resp.Logprobs...)
+			}
 		})
 
 		if err != nil {
 			return err
 		}
 
-		// Step 3: Accept/reject using standard speculative decoding criterion
+		// Step 3: Compare draft and target tokens, accept where they match
 		accepted := 0
-		for i := 0; i < len(draftTokens) && i < len(targetLogprobs); i++ {
-			targetProb := math.Exp(targetLogprobs[i].Logprob)
-			draftProb := math.Exp(draftLogprobs[i])
-
-			if draftProb <= 1e-10 {
-				break
-			}
-
-			acceptanceRatio := targetProb / draftProb
-
-			// Accept if target agrees or probabilistically based on ratio
-			if acceptanceRatio >= 1.0 || rand.Float64() < acceptanceRatio {
+		for i := 0; i < len(draftTokens) && i < len(targetTokens); i++ {
+			// Simple token matching - accept if tokens match
+			if draftTokens[i] == targetTokens[i] {
 				accepted++
 				totalAccepted++
+				
+				// Emit accepted token
+				fn(llm.CompletionResponse{
+					Content:  draftTokens[i],
+					Logprobs: targetLogprobs[i:i+1],
+				})
+				
+				currentPrompt += draftTokens[i]
+				totalGenerated++
 			} else {
+				// Tokens mismatch - emit target's correction and stop accepting
+				fn(llm.CompletionResponse{
+					Content:  targetTokens[i],
+					Logprobs: targetLogprobs[i:i+1],
+				})
+				
+				currentPrompt += targetTokens[i]
+				totalGenerated++
 				break
 			}
 		}
 
-		// Emit accepted tokens
-		for i := 0; i < accepted; i++ {
+		// If we accepted all draft tokens and target produced one more, emit it
+		if accepted == len(draftTokens) && len(targetTokens) > len(draftTokens) {
+			extraToken := targetTokens[len(draftTokens)]
+			var extraLogprobs []llm.Logprob
+			if len(targetLogprobs) > len(draftTokens) {
+				extraLogprobs = targetLogprobs[len(draftTokens):len(draftTokens)+1]
+			}
+			
 			fn(llm.CompletionResponse{
-				Content: draftTokens[i],
+				Content:  extraToken,
+				Logprobs: extraLogprobs,
 			})
-			currentPrompt.WriteString(draftTokens[i])
-		}
-
-		// If not all accepted, emit the corrected token from target
-		if accepted < len(draftTokens) && len(targetContent) > 0 {
-			// Get the correction token (what target predicted at the rejection point)
-			correctionStart := 0
-			for i := 0; i < accepted && correctionStart < len(targetContent); i++ {
-				correctionStart += len(draftTokens[i])
-			}
-			if correctionStart < len(targetContent) {
-				// Find next token boundary (simplified - just take remaining)
-				correction := targetContent[correctionStart:]
-				if len(correction) > 0 {
-					// Take just one token worth
-					fn(llm.CompletionResponse{
-						Content: correction,
-					})
-					currentPrompt.WriteString(correction)
-				}
-			}
+			
+			currentPrompt += extraToken
+			totalGenerated++
 		}
 
 		if targetDone {
-			// Final response with metrics
-			duration := time.Since(startTime)
-			acceptanceRate := 0.0
-			if totalDraft > 0 {
-				acceptanceRate = float64(totalAccepted) / float64(totalDraft)
-			}
-
-			slog.Info("speculative decoding completed",
-				"total_draft", totalDraft,
-				"total_accepted", totalAccepted,
-				"acceptance_rate", acceptanceRate,
-				"duration", duration)
-
-			fn(llm.CompletionResponse{
-				Done:       true,
-				DoneReason: llm.DoneReasonStop,
-			})
 			break
 		}
+
+		// Log progress
+		acceptanceRate := float64(0)
+		if totalDraft > 0 {
+			acceptanceRate = float64(totalAccepted) / float64(totalDraft) * 100
+		}
+		slog.Debug("speculative decoding progress",
+			"accepted", accepted,
+			"draft_tokens", len(draftTokens),
+			"total_acceptance_rate", fmt.Sprintf("%.1f%%", acceptanceRate))
 	}
+
+	// Send final response
+	duration := time.Since(startTime)
+	acceptanceRate := float64(0)
+	if totalDraft > 0 {
+		acceptanceRate = float64(totalAccepted) / float64(totalDraft)
+	}
+
+	slog.Info("speculative decoding completed",
+		"total_draft_tokens", totalDraft,
+		"total_accepted", totalAccepted,
+		"acceptance_rate", fmt.Sprintf("%.1f%%", acceptanceRate*100),
+		"duration", duration,
+		"tokens_generated", totalGenerated)
+
+	fn(llm.CompletionResponse{
+		Done:       true,
+		DoneReason: llm.DoneReasonStop,
+	})
+
+	// Update engine stats
+	e.mu.Lock()
+	e.totalTokens += totalDraft
+	e.acceptedTokens += totalAccepted
+	e.mu.Unlock()
 
 	return nil
 }

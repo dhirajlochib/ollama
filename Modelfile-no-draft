@@ -1,0 +1,2 @@
+FROM qwen2.5:3b
+PARAMETER temperature 0.7

@@ -658,16 +658,32 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 			ch <- res
 		}
 
-		// Use speculative decoding if engine is ready, otherwise fall back to normal completion
-		if specEngine != nil && specEngine.IsReady() {
-			slog.Info("using speculative decoding for completion", "draft", m.Draft)
-			completionErr = specEngine.SpeculativeCompletion(c.Request.Context(), completionReq, completionFn)
-		} else {
-			if m.Draft != "" {
-				slog.Debug("draft model not ready, using normal completion", "draft", m.Draft)
+		// Speculative decoding infrastructure is ready but the actual speedup requires
+		// deep runner-level integration. The draft model loads alongside the target model,
+		// but using it for actual speculation requires changes to the core inference loop
+		// in runner/ollamarunner/runner.go.
+		//
+		// What's implemented:
+		// ✅ DRAFT command in Modelfile
+		// ✅ Draft model co-loading with target model  
+		// ✅ Speculative engine with acceptance algorithm
+		//
+		// What's needed for actual speedup:
+		// - Integration into runner's token-by-token generation loop
+		// - Shared KV cache management between draft and target
+		// - Batch verification of draft tokens in single forward pass
+		//
+		// For now, use normal completion but log when draft model is available
+		if m.Draft != "" {
+			draftRunner := s.getDraftRunner(m.Draft)
+			if draftRunner != nil {
+				slog.Info("speculative decoding ready (infrastructure)",
+					"draft_model", m.Draft,
+					"note", "runner integration needed for speedup")
 			}
-			completionErr = r.Completion(c.Request.Context(), completionReq, completionFn)
 		}
+		
+		completionErr = r.Completion(c.Request.Context(), completionReq, completionFn)
 
 		if completionErr != nil {
 			var serr api.StatusError
