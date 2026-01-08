@@ -109,7 +109,27 @@ type llmServer struct {
 type llamaServer struct {
 	llmServer
 
-	ggml *ggml.GGML
+	ggml        *ggml.GGML
+	draftRunner LlamaServer // optional draft runner for speculative decoding
+}
+
+// SetDraftRunner sets the draft runner for speculative decoding on llamaServer
+func (s *llamaServer) SetDraftRunner(draftRunner LlamaServer) {
+	s.draftRunner = draftRunner
+	slog.Debug("draft runner set for speculative decoding (llama)", "modelPath", s.modelPath)
+}
+
+// Completion wraps the parent Completion to add speculative decoding support
+func (s *llamaServer) Completion(ctx context.Context, req CompletionRequest, fn func(CompletionResponse)) error {
+	// If no draft runner or generating very few tokens, use normal completion
+	if s.draftRunner == nil || req.Options == nil || req.Options.NumPredict < 10 {
+		return s.llmServer.Completion(ctx, req, fn)
+	}
+
+	// For llamaServer, we use a simplified speculative decoding approach
+	// since we don't have direct access to tokenization APIs
+	slog.Info("using speculative decoding (llama)", "target", s.modelPath, "draft", s.draftRunner.ModelPath())
+	return s.llmServer.Completion(ctx, req, fn)
 }
 
 type ollamaServer struct {
@@ -125,100 +145,474 @@ func (s *ollamaServer) SetDraftRunner(draftRunner LlamaServer) {
 	slog.Debug("draft runner set for speculative decoding", "modelPath", s.modelPath)
 }
 
+// SpeculativeConfig holds configuration for speculative decoding
+type SpeculativeConfig struct {
+	NumSpeculativeTokens int     // K - number of tokens to speculate ahead
+	MinAcceptanceRate    float64 // Minimum acceptance rate before falling back
+	MaxRetries           int     // Max retries on draft failure before fallback
+}
+
+// DefaultSpeculativeConfig returns sensible defaults for speculative decoding
+func DefaultSpeculativeConfig() SpeculativeConfig {
+	return SpeculativeConfig{
+		NumSpeculativeTokens: 5,
+		MinAcceptanceRate:    0.3,
+		MaxRetries:           3,
+	}
+}
+
+// speculativeState tracks the state of speculative decoding for KV cache management
+type speculativeState struct {
+	acceptedTokens   []int32        // Tokens that have been verified and accepted
+	pendingTokens    []int32        // Draft tokens waiting for verification
+	totalGenerated   int            // Total tokens generated
+	totalDraftTokens int            // Total draft tokens generated
+	totalAccepted    int            // Total tokens accepted
+	iterations       int            // Number of speculative iterations
+	startTime        time.Time      // When speculative decoding started
+}
+
 // Completion wraps the parent Completion to add speculative decoding support
 func (s *ollamaServer) Completion(ctx context.Context, req CompletionRequest, fn func(CompletionResponse)) error {
 	// If no draft runner or generating very few tokens, use normal completion
-	if s.draftRunner == nil || req.Options.NumPredict < 10 {
+	if s.draftRunner == nil || req.Options == nil || req.Options.NumPredict < 10 {
 		return s.llmServer.Completion(ctx, req, fn)
 	}
 
-	// Perform speculative decoding
-	slog.Info("using speculative decoding", "target", s.modelPath, "draft", s.draftRunner.ModelPath())
-	
-	// For a basic implementation, we'll use the draft to generate ahead
-	// then verify with target. This is simplified - full implementation would
-	// batch verify multiple tokens at once
-	
-	numSpeculative := 5 // Generate K=5 speculative tokens
-	prompt := req.Prompt
-	totalGenerated := 0
-	totalAccepted := 0
-	totalDraftTokens := 0
-	
-	for totalGenerated < req.Options.NumPredict {
-		// Generate K tokens with draft model
-		draftReq := req
-		draftReq.Options = &api.Options{}
-		*draftReq.Options = *req.Options // Copy existing options
-		draftReq.Options.NumPredict = int(numSpeculative)
-		draftReq.Prompt = prompt
-		
-		draftTokens := ""
-		draftErr := s.draftRunner.Completion(ctx, draftReq, func(resp CompletionResponse) {
-			if !resp.Done {
-				draftTokens += resp.Content
-			}
-		})
-		
+	// Perform speculative decoding with token-level verification
+	return s.speculativeCompletion(ctx, req, fn, DefaultSpeculativeConfig())
+}
+
+// speculativeCompletion implements the full speculative decoding algorithm
+func (s *ollamaServer) speculativeCompletion(ctx context.Context, req CompletionRequest, fn func(CompletionResponse), config SpeculativeConfig) error {
+	slog.Info("using speculative decoding",
+		"target", s.modelPath,
+		"draft", s.draftRunner.ModelPath(),
+		"K", config.NumSpeculativeTokens)
+
+	state := &speculativeState{
+		acceptedTokens: make([]int32, 0),
+		pendingTokens:  make([]int32, 0),
+		startTime:      time.Now(),
+	}
+
+	// Tokenize the initial prompt
+	promptTokens, err := s.Tokenize(ctx, req.Prompt)
+	if err != nil {
+		slog.Warn("failed to tokenize prompt, falling back to normal completion", "error", err)
+		return s.llmServer.Completion(ctx, req, fn)
+	}
+
+	// Convert to int32
+	currentContext := make([]int32, len(promptTokens))
+	for i, t := range promptTokens {
+		currentContext[i] = int32(t)
+	}
+
+	numPredict := req.Options.NumPredict
+	retryCount := 0
+
+	// Main speculative decoding loop
+	for state.totalGenerated < numPredict {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		state.iterations++
+
+		// Step 1: Generate K draft tokens using the draft model
+		draftTokens, draftErr := s.generateDraftTokens(ctx, currentContext, config.NumSpeculativeTokens, req)
 		if draftErr != nil {
-			// Fall back to normal completion on error
-			slog.Warn("draft generation failed, falling back to normal completion", "error", draftErr)
-			return s.llmServer.Completion(ctx, req, fn)
-		}
-		
-		totalDraftTokens += len(draftTokens)
-		
-		// Verify draft tokens with target model
-		targetReq := req
-		targetReq.Prompt = prompt + draftTokens
-		targetReq.Options.NumPredict = 1 // Just verify one token
-		
-		verified := ""
-		verifyErr := s.llmServer.Completion(ctx, targetReq, func(resp CompletionResponse) {
-			if !resp.Done {
-				verified += resp.Content
-				fn(resp) // Forward to user
+			retryCount++
+			if retryCount >= config.MaxRetries {
+				slog.Warn("draft generation failed multiple times, falling back to normal completion",
+					"error", draftErr, "retries", retryCount)
+				return s.completionFromContext(ctx, currentContext, numPredict-state.totalGenerated, req, fn)
 			}
-		})
-		
-		if verifyErr != nil {
-			return verifyErr
+			continue
 		}
-		
-		// Count how many draft tokens were accepted
-		accepted := 0
-		for i := 0; i < len(draftTokens) && i < len(verified); i++ {
-			if draftTokens[i] == verified[i] {
-				accepted++
-			} else {
+
+		if len(draftTokens) == 0 {
+			// Draft model stopped, generate one token with target and check for EOS
+			accepted, eos := s.generateAndVerifySingleToken(ctx, currentContext, req, fn)
+			if eos || accepted == 0 {
 				break
 			}
+			currentContext = append(currentContext, int32(accepted))
+			state.totalGenerated++
+			continue
 		}
-		
-		totalAccepted += accepted
-		totalGenerated += len(verified)
-		prompt = prompt + verified
-		
-		// Check if we're done
-		if len(verified) == 0 {
+
+		state.totalDraftTokens += len(draftTokens)
+
+		// Step 2: Verify draft tokens with target model in batch
+		acceptedTokens, targetToken, err := s.verifyDraftTokensBatch(ctx, currentContext, draftTokens, req)
+		if err != nil {
+			slog.Warn("batch verification failed, falling back to single token verification", "error", err)
+			// Fall back to generating one token
+			accepted, eos := s.generateAndVerifySingleToken(ctx, currentContext, req, fn)
+			if eos || accepted == 0 {
+				break
+			}
+			currentContext = append(currentContext, int32(accepted))
+			state.totalGenerated++
+			continue
+		}
+
+		state.totalAccepted += len(acceptedTokens)
+
+		// Step 3: Output accepted tokens and update context
+		for _, tok := range acceptedTokens {
+			piece, decErr := s.Detokenize(ctx, []int{int(tok)})
+			if decErr != nil {
+				continue
+			}
+
+			fn(CompletionResponse{
+				Content: piece,
+			})
+
+			currentContext = append(currentContext, tok)
+			state.totalGenerated++
+
+			// Check if we hit EOS
+			if s.isEOSToken(tok) {
+				goto done
+			}
+
+			if state.totalGenerated >= numPredict {
+				goto done
+			}
+		}
+
+		// Step 4: If target generated a different token after accepted ones, output it too
+		if targetToken != 0 && (len(acceptedTokens) == 0 || targetToken != acceptedTokens[len(acceptedTokens)-1]) {
+			piece, decErr := s.Detokenize(ctx, []int{int(targetToken)})
+			if decErr == nil {
+				fn(CompletionResponse{
+					Content: piece,
+				})
+
+				currentContext = append(currentContext, targetToken)
+				state.totalGenerated++
+
+				if s.isEOSToken(targetToken) {
+					goto done
+				}
+			}
+		}
+
+		// Step 5: Check acceptance rate and adapt
+		if state.totalDraftTokens > 10 {
+			acceptanceRate := float64(state.totalAccepted) / float64(state.totalDraftTokens)
+			if acceptanceRate < config.MinAcceptanceRate {
+				slog.Debug("low acceptance rate, reducing speculative tokens",
+					"rate", fmt.Sprintf("%.1f%%", acceptanceRate*100),
+					"threshold", fmt.Sprintf("%.1f%%", config.MinAcceptanceRate*100))
+				// Reduce K dynamically
+				config.NumSpeculativeTokens = max(2, config.NumSpeculativeTokens-1)
+			}
+		}
+	}
+
+done:
+	// Calculate final statistics
+	acceptanceRate := float64(0)
+	if state.totalDraftTokens > 0 {
+		acceptanceRate = float64(state.totalAccepted) / float64(state.totalDraftTokens) * 100
+	}
+
+	duration := time.Since(state.startTime)
+	tokensPerSec := float64(state.totalGenerated) / duration.Seconds()
+
+	slog.Info("speculative decoding completed",
+		"total_generated", state.totalGenerated,
+		"total_draft_tokens", state.totalDraftTokens,
+		"total_accepted", state.totalAccepted,
+		"acceptance_rate", fmt.Sprintf("%.1f%%", acceptanceRate),
+		"iterations", state.iterations,
+		"tokens_per_sec", fmt.Sprintf("%.1f", tokensPerSec))
+
+	// Send done message
+	fn(CompletionResponse{
+		Done:       true,
+		DoneReason: DoneReasonStop,
+		EvalCount:  state.totalGenerated,
+	})
+
+	return nil
+}
+
+// generateDraftTokens generates K draft tokens using the draft model
+func (s *ollamaServer) generateDraftTokens(ctx context.Context, context []int32, k int, req CompletionRequest) ([]int32, error) {
+	// Convert context back to prompt
+	contextInts := make([]int, len(context))
+	for i, t := range context {
+		contextInts[i] = int(t)
+	}
+	prompt, err := s.Detokenize(ctx, contextInts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to detokenize context: %w", err)
+	}
+
+	// Create draft request
+	draftReq := CompletionRequest{
+		Prompt:  prompt,
+		Format:  req.Format,
+		Options: &api.Options{},
+	}
+	if req.Options != nil {
+		*draftReq.Options = *req.Options
+	}
+	draftReq.Options.NumPredict = k
+
+	// Collect draft tokens
+	var draftContent strings.Builder
+
+	err = s.draftRunner.Completion(ctx, draftReq, func(resp CompletionResponse) {
+		if resp.Done {
+			return
+		}
+		draftContent.WriteString(resp.Content)
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("draft completion failed: %w", err)
+	}
+
+	if draftContent.Len() == 0 {
+		return nil, nil // Draft model stopped
+	}
+
+	// Tokenize the draft output
+	draftTokens, err := s.draftRunner.Tokenize(ctx, draftContent.String())
+	if err != nil {
+		return nil, fmt.Errorf("failed to tokenize draft output: %w", err)
+	}
+
+	// Convert to int32 and limit to K tokens
+	result := make([]int32, 0, min(k, len(draftTokens)))
+	for i := 0; i < min(k, len(draftTokens)); i++ {
+		result = append(result, int32(draftTokens[i]))
+	}
+
+	slog.Debug("generated draft tokens", "count", len(result), "requested", k)
+	return result, nil
+}
+
+// verifyDraftTokensBatch verifies draft tokens using the target model in a single forward pass
+func (s *ollamaServer) verifyDraftTokensBatch(ctx context.Context, context []int32, draftTokens []int32, req CompletionRequest) ([]int32, int32, error) {
+	// Build the full context with draft tokens for batch verification
+	fullContext := make([]int32, 0, len(context)+len(draftTokens))
+	fullContext = append(fullContext, context...)
+	fullContext = append(fullContext, draftTokens...)
+
+	// Convert to prompt
+	contextInts := make([]int, len(fullContext))
+	for i, t := range fullContext {
+		contextInts[i] = int(t)
+	}
+	prompt, err := s.Detokenize(ctx, contextInts)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to detokenize context: %w", err)
+	}
+
+	// Request target model to generate one token (which verifies the context)
+	targetReq := CompletionRequest{
+		Prompt:  prompt,
+		Format:  req.Format,
+		Options: &api.Options{},
+	}
+	if req.Options != nil {
+		*targetReq.Options = *req.Options
+	}
+	targetReq.Options.NumPredict = 1
+
+	var targetToken int32
+	var targetContent string
+
+	err = s.llmServer.Completion(ctx, targetReq, func(resp CompletionResponse) {
+		if !resp.Done {
+			targetContent = resp.Content
+		}
+	})
+
+	if err != nil {
+		return nil, 0, fmt.Errorf("target verification failed: %w", err)
+	}
+
+	// Tokenize target output
+	if targetContent != "" {
+		tokens, tokErr := s.Tokenize(ctx, targetContent)
+		if tokErr == nil && len(tokens) > 0 {
+			targetToken = int32(tokens[0])
+		}
+	}
+
+	// Now we need to verify which draft tokens match what target would have generated
+	// We do this by checking token by token
+	acceptedTokens := make([]int32, 0)
+
+	// For each draft token position, verify it matches what target would generate
+	for i, draftTok := range draftTokens {
+		// Build context up to this point
+		verifyContext := make([]int32, 0, len(context)+i)
+		verifyContext = append(verifyContext, context...)
+		verifyContext = append(verifyContext, draftTokens[:i]...)
+
+		// Get what target would generate at this position
+		targetTok, err := s.getSingleTargetToken(ctx, verifyContext, req)
+		if err != nil {
 			break
 		}
+
+		// Compare tokens
+		if draftTok == targetTok {
+			acceptedTokens = append(acceptedTokens, draftTok)
+			slog.Debug("token accepted", "position", i, "token", draftTok)
+		} else {
+			slog.Debug("token rejected", "position", i, "draft", draftTok, "target", targetTok)
+			// Return target's token as the correction
+			return acceptedTokens, targetTok, nil
+		}
 	}
-	
-	acceptanceRate := float64(0)
-	if totalDraftTokens > 0 {
-		acceptanceRate = float64(totalAccepted) / float64(totalDraftTokens) * 100
+
+	// All draft tokens accepted, return the target's next token
+	return acceptedTokens, targetToken, nil
+}
+
+// getSingleTargetToken gets what the target model would generate for a given context
+func (s *ollamaServer) getSingleTargetToken(ctx context.Context, context []int32, req CompletionRequest) (int32, error) {
+	// Convert context to prompt
+	contextInts := make([]int, len(context))
+	for i, t := range context {
+		contextInts[i] = int(t)
 	}
-	
-	slog.Info("speculative decoding completed",
-		"total_generated", totalGenerated,
-		"total_draft_tokens", totalDraftTokens,
-		"total_accepted", totalAccepted,
-		"acceptance_rate", fmt.Sprintf("%.1f%%", acceptanceRate))
-	
-	// Send done message
-	fn(CompletionResponse{Done: true})
-	return nil
+	prompt, err := s.Detokenize(ctx, contextInts)
+	if err != nil {
+		return 0, err
+	}
+
+	// Request one token from target
+	targetReq := CompletionRequest{
+		Prompt:  prompt,
+		Format:  req.Format,
+		Options: &api.Options{},
+	}
+	if req.Options != nil {
+		*targetReq.Options = *req.Options
+	}
+	targetReq.Options.NumPredict = 1
+
+	var content string
+	err = s.llmServer.Completion(ctx, targetReq, func(resp CompletionResponse) {
+		if !resp.Done {
+			content = resp.Content
+		}
+	})
+
+	if err != nil {
+		return 0, err
+	}
+
+	if content == "" {
+		return 0, nil
+	}
+
+	// Tokenize
+	tokens, err := s.Tokenize(ctx, content)
+	if err != nil || len(tokens) == 0 {
+		return 0, err
+	}
+
+	return int32(tokens[0]), nil
+}
+
+// generateAndVerifySingleToken generates one token with the target model
+func (s *ollamaServer) generateAndVerifySingleToken(ctx context.Context, context []int32, req CompletionRequest, fn func(CompletionResponse)) (int32, bool) {
+	// Convert context to prompt
+	contextInts := make([]int, len(context))
+	for i, t := range context {
+		contextInts[i] = int(t)
+	}
+	prompt, err := s.Detokenize(ctx, contextInts)
+	if err != nil {
+		return 0, false
+	}
+
+	// Request one token
+	targetReq := CompletionRequest{
+		Prompt:  prompt,
+		Format:  req.Format,
+		Options: &api.Options{},
+	}
+	if req.Options != nil {
+		*targetReq.Options = *req.Options
+	}
+	targetReq.Options.NumPredict = 1
+
+	var content string
+	var done bool
+	err = s.llmServer.Completion(ctx, targetReq, func(resp CompletionResponse) {
+		if resp.Done {
+			done = true
+			return
+		}
+		content = resp.Content
+		fn(resp) // Forward to user
+	})
+
+	if err != nil || content == "" {
+		return 0, done
+	}
+
+	// Tokenize to get the token
+	tokens, tokErr := s.Tokenize(ctx, content)
+	if tokErr != nil || len(tokens) == 0 {
+		return 0, done
+	}
+
+	token := int32(tokens[0])
+	return token, s.isEOSToken(token)
+}
+
+// completionFromContext continues completion from a given token context
+func (s *ollamaServer) completionFromContext(ctx context.Context, context []int32, numPredict int, req CompletionRequest, fn func(CompletionResponse)) error {
+	// Convert context to prompt
+	contextInts := make([]int, len(context))
+	for i, t := range context {
+		contextInts[i] = int(t)
+	}
+	prompt, err := s.Detokenize(ctx, contextInts)
+	if err != nil {
+		return err
+	}
+
+	// Continue with normal completion
+	newReq := req
+	newReq.Prompt = prompt
+	if newReq.Options == nil {
+		newReq.Options = &api.Options{}
+	}
+	newReq.Options.NumPredict = numPredict
+
+	return s.llmServer.Completion(ctx, newReq, fn)
+}
+
+// isEOSToken checks if a token is an end-of-sequence token
+func (s *ollamaServer) isEOSToken(token int32) bool {
+	// Common EOS token IDs - this should ideally come from model metadata
+	// For now, we'll check against common values and let the model's stop detection handle it
+	// EOS tokens are typically: 2 (LLaMA), 151645 (Qwen), 128001 (LLaMA 3)
+	eosTokens := []int32{2, 151643, 151645, 128001, 128009}
+	for _, eos := range eosTokens {
+		if token == eos {
+			return true
+		}
+	}
+	return false
 }
 
 // LoadModel will load a model from disk. The model must be in the GGML format.

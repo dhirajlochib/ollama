@@ -199,10 +199,18 @@ func (s *Server) getDraftRunner(draftName string) llm.LlamaServer {
 
 	draftModel, err := GetModel(draftName)
 	if err != nil {
+		slog.Debug("failed to get draft model", "draft", draftName, "error", err)
 		return nil
 	}
 
-	return s.sched.GetLoadedRunner(draftModel.ModelPath)
+	slog.Debug("looking for draft runner", "draft", draftName, "modelPath", draftModel.ModelPath)
+	runner := s.sched.GetLoadedRunner(draftModel.ModelPath)
+	if runner != nil {
+		slog.Info("draft model loaded for speculative decoding", "draft", draftName)
+	} else {
+		slog.Debug("draft runner not yet loaded", "draft", draftName, "modelPath", draftModel.ModelPath)
+	}
+	return runner
 }
 
 // getSpeculativeEngine creates a speculative decoding engine if draft model is available
@@ -656,9 +664,18 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 			ch <- res
 		}
 
-		// Speculative decoding: inject draft runner into target runner if available
+		// Speculative decoding: load and inject draft runner into target runner
 		if m.Draft != "" {
-			draftRunner := s.getDraftRunner(m.Draft)
+			// Wait for draft runner to be available (with timeout)
+			var draftRunner llm.LlamaServer
+			for i := 0; i < 50; i++ { // Wait up to 5 seconds
+				draftRunner = s.getDraftRunner(m.Draft)
+				if draftRunner != nil {
+					break
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+			
 			if draftRunner != nil {
 				// Try to inject draft runner into the target runner for speculative decoding
 				// This requires the runner to support SetDraftRunner method
@@ -675,6 +692,9 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 						"draft_model", m.Draft,
 						"runner_type", fmt.Sprintf("%T", r))
 				}
+			} else {
+				slog.Warn("draft model not loaded in time, proceeding without speculative decoding",
+					"draft_model", m.Draft)
 			}
 		}
 		
