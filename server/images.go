@@ -233,6 +233,13 @@ func (m *Model) String() string {
 		})
 	}
 
+	if m.Config.Draft != "" {
+		modelfile.Commands = append(modelfile.Commands, parser.Command{
+			Name: "draft",
+			Args: m.Config.Draft,
+		})
+	}
+
 	for k, v := range m.Options {
 		switch v := v.(type) {
 		case []any:

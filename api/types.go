@@ -745,6 +745,7 @@ type ShowResponse struct {
 	Capabilities  []model.Capability `json:"capabilities,omitempty"`
 	ModifiedAt    time.Time          `json:"modified_at,omitempty"`
 	Requires      string             `json:"requires,omitempty"`
+	Draft         string             `json:"draft,omitempty"`
 }
 
 // CopyRequest is the request passed to [Client.Copy].
