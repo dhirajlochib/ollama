@@ -1716,6 +1716,94 @@ func displayResponse(content string, wordWrap bool, state *displayResponseState)
 	}
 }
 
+// diffusionDisplayState tracks the state of diffusion block rendering.
+type diffusionDisplayState struct {
+	lastBlock      int
+	lastStep       int
+	headerPrinted  bool
+	prevUnmasked   int
+	blockPrintedAt int // cursor position tracking
+}
+
+// displayDiffusionBlock renders a real-time diffusion denoising visualization.
+// It shows tokens materializing from masked positions with ANSI color effects:
+//   - Masked tokens are shown as dim "░" characters
+//   - Newly unmasked tokens flash bright green before settling to normal
+//   - A progress bar shows the denoising progress within the block
+func displayDiffusionBlock(response interface{ getDiffusion() (int, int, int, int, int, []string) }, state *diffusionDisplayState) {
+	block, step, maxSteps, unmasked, blockSize, tokens := response.getDiffusion()
+	if blockSize == 0 || len(tokens) == 0 {
+		return
+	}
+
+	// Print block header on new block
+	if block != state.lastBlock || !state.headerPrinted {
+		if state.headerPrinted {
+			fmt.Println() // newline after previous block
+		}
+		// Block header with ANSI styling
+		fmt.Printf("\x1b[1;36m⟨Block %d⟩\x1b[0m ", block)
+		state.lastBlock = block
+		state.headerPrinted = true
+		state.prevUnmasked = 0
+		state.blockPrintedAt = 0
+	}
+
+	// Clear previous block rendering (move cursor back)
+	if state.blockPrintedAt > 0 {
+		fmt.Printf("\r\x1b[K") // clear current line
+		fmt.Printf("\x1b[1;36m⟨Block %d⟩\x1b[0m ", block)
+	}
+
+	// Render tokens with materialization effect
+	for i, tok := range tokens {
+		if tok == "" {
+			// Masked position — show dim placeholder
+			fmt.Printf("\x1b[2;37m░\x1b[0m")
+		} else if i >= state.prevUnmasked && state.prevUnmasked > 0 {
+			// Newly unmasked — bright green flash
+			fmt.Printf("\x1b[1;32m%s\x1b[0m", tok)
+		} else {
+			// Previously unmasked — normal
+			fmt.Printf("%s", tok)
+		}
+	}
+
+	// Progress indicator
+	pct := float64(unmasked) / float64(blockSize) * 100
+	fmt.Printf(" \x1b[2;33m[step %d/%d %.0f%%]\x1b[0m", step, maxSteps, pct)
+
+	state.lastStep = step
+	state.prevUnmasked = unmasked
+	state.blockPrintedAt = 1
+}
+
+// displayDiffusionProgress renders a compact diffusion progress line for chat mode.
+// Shows: ⟨Diffusion Block N⟩ ████░░░░ step/max (unmasked/total)
+func displayDiffusionProgress(block, step, maxSteps, unmasked, blockSize int) {
+	if blockSize == 0 {
+		return
+	}
+
+	barWidth := 20
+	filled := int(float64(unmasked) / float64(blockSize) * float64(barWidth))
+	if filled > barWidth {
+		filled = barWidth
+	}
+
+	bar := ""
+	for i := 0; i < barWidth; i++ {
+		if i < filled {
+			bar += "█"
+		} else {
+			bar += "░"
+		}
+	}
+
+	fmt.Printf("\r\x1b[K\x1b[2;36m⟨Diffusion Block %d⟩\x1b[0m %s \x1b[33mstep %d/%d\x1b[0m \x1b[32m(%d/%d tokens)\x1b[0m",
+		block, bar, step, maxSteps, unmasked, blockSize)
+}
+
 func thinkingOutputOpeningText(plainText bool) string {
 	text := "Thinking...\n"
 
@@ -1765,6 +1853,8 @@ func chat(cmd *cobra.Command, opts runOptions) (*api.Message, error) {
 	var fullResponse strings.Builder
 	var thinkTagOpened bool = false
 	var thinkTagClosed bool = false
+	var diffState *diffusionDisplayState
+	var lastDiffBlock int = -1
 
 	role := "assistant"
 
@@ -1774,6 +1864,29 @@ func chat(cmd *cobra.Command, opts runOptions) (*api.Message, error) {
 		}
 
 		latest = response
+
+		// Handle diffusion streaming display
+		if response.DiffusionBlockSize > 0 {
+			p.StopAndClear()
+			if diffState == nil {
+				diffState = &diffusionDisplayState{}
+			}
+			displayDiffusionProgress(
+				response.DiffusionBlock,
+				response.DiffusionStep,
+				response.DiffusionMaxSteps,
+				response.DiffusionUnmasked,
+				response.DiffusionBlockSize,
+			)
+			// When a block is fully unmasked, print the finalized tokens
+			if response.DiffusionUnmasked >= response.DiffusionBlockSize {
+				if response.DiffusionBlock != lastDiffBlock {
+					fmt.Println() // finish progress line
+					lastDiffBlock = response.DiffusionBlock
+				}
+			}
+			// The actual content still comes through Message.Content
+		}
 
 		role = response.Message.Role
 		if response.Message.Thinking != "" && !opts.HideThinking {
@@ -1813,6 +1926,7 @@ func chat(cmd *cobra.Command, opts runOptions) (*api.Message, error) {
 
 		return nil
 	}
+	_ = diffState // used for future enhanced diffusion rendering
 
 	if opts.Format == "json" {
 		opts.Format = `"` + opts.Format + `"`
@@ -1905,6 +2019,18 @@ func generate(cmd *cobra.Command, opts runOptions) error {
 
 		if response.Response != "" || !opts.HideThinking {
 			p.StopAndClear()
+		}
+
+		// Handle diffusion streaming display
+		if response.DiffusionBlockSize > 0 {
+			p.StopAndClear()
+			displayDiffusionProgress(
+				response.DiffusionBlock,
+				response.DiffusionStep,
+				response.DiffusionMaxSteps,
+				response.DiffusionUnmasked,
+				response.DiffusionBlockSize,
+			)
 		}
 
 		if response.Thinking != "" && !opts.HideThinking {

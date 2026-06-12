@@ -560,6 +560,26 @@ type ChatResponse struct {
 	Logprobs []Logprob `json:"logprobs,omitempty"`
 
 	Metrics
+
+	// Experimental: Diffusion generation fields (may change or be removed)
+
+	// DiffusionBlock is the current block index being denoised (0-based).
+	DiffusionBlock int `json:"diffusion_block,omitempty"`
+
+	// DiffusionStep is the current denoising step within the block.
+	DiffusionStep int `json:"diffusion_step,omitempty"`
+
+	// DiffusionMaxSteps is the maximum denoising steps per block.
+	DiffusionMaxSteps int `json:"diffusion_max_steps,omitempty"`
+
+	// DiffusionUnmasked is the count of tokens unmasked so far in the current block.
+	DiffusionUnmasked int `json:"diffusion_unmasked,omitempty"`
+
+	// DiffusionBlockSize is the total tokens per block.
+	DiffusionBlockSize int `json:"diffusion_block_size,omitempty"`
+
+	// DiffusionBlockTokens contains the current state of all tokens in the block.
+	DiffusionBlockTokens []string `json:"diffusion_block_tokens,omitempty"`
 }
 
 // DebugInfo contains debug information for template rendering
@@ -922,6 +942,34 @@ type GenerateResponse struct {
 	// Total is the total number of steps for image generation.
 	// Only present for image generation models during streaming.
 	Total int64 `json:"total,omitempty"`
+
+	// Experimental: Diffusion generation fields (may change or be removed)
+
+	// DiffusionBlock is the current block index being denoised (0-based).
+	// Only present for diffusion models during streaming.
+	DiffusionBlock int `json:"diffusion_block,omitempty"`
+
+	// DiffusionStep is the current denoising step within the block.
+	// Only present for diffusion models during streaming.
+	DiffusionStep int `json:"diffusion_step,omitempty"`
+
+	// DiffusionMaxSteps is the maximum denoising steps per block.
+	// Only present for diffusion models during streaming.
+	DiffusionMaxSteps int `json:"diffusion_max_steps,omitempty"`
+
+	// DiffusionUnmasked is the count of tokens unmasked so far in the current block.
+	// Only present for diffusion models during streaming.
+	DiffusionUnmasked int `json:"diffusion_unmasked,omitempty"`
+
+	// DiffusionBlockSize is the total tokens per block.
+	// Only present for diffusion models during streaming.
+	DiffusionBlockSize int `json:"diffusion_block_size,omitempty"`
+
+	// DiffusionBlockTokens contains the current state of all tokens in the block,
+	// with masked positions shown as empty strings. This enables the UI to show
+	// real-time token materialization during denoising.
+	// Only present for diffusion models during streaming.
+	DiffusionBlockTokens []string `json:"diffusion_block_tokens,omitempty"`
 }
 
 // ModelDetails provides details about a model.
