@@ -37,7 +37,7 @@ func newMockLogitsProvider(cfg mockConfig) *mockLogitsProvider {
 
 	// Initialize random weights for each layer
 	weights := make([][][]float32, cfg.numLayers)
-	for l := 0; l < cfg.numLayers; l++ {
+	for l := range cfg.numLayers {
 		weights[l] = make([][]float32, cfg.hiddenSize)
 		for h := 0; h < cfg.hiddenSize; h++ {
 			weights[l][h] = make([]float32, cfg.vocabSize)
@@ -232,8 +232,8 @@ func TestDenoiseBlockMonotonicUnmasking(t *testing.T) {
 		nil, // no prefix
 		block,
 		cfg.vocabSize,
-		0.1,  // entropy bound
-		48,   // max steps
+		0.1, // entropy bound
+		48,  // max steps
 		callback,
 		0,
 	)
@@ -518,9 +518,9 @@ func TestDiffusionOptionsDefaults(t *testing.T) {
 	cfg := testConfig{
 		"diffusiongemma.block_count":             uint32(1),
 		"diffusiongemma.embedding_length":        uint32(32),
-		"diffusiongemma.attention.key_length":     uint32(8),
-		"diffusiongemma.attention.head_count":     uint32(2),
-		"diffusiongemma.attention.head_count_kv":  uint32(1),
+		"diffusiongemma.attention.key_length":    uint32(8),
+		"diffusiongemma.attention.head_count":    uint32(2),
+		"diffusiongemma.attention.head_count_kv": uint32(1),
 	}
 
 	// Test that defaults are applied when GGUF metadata is missing

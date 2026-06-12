@@ -221,7 +221,7 @@ func RunDiffusionDecode(
 
 	var prefixTokens []int32
 
-	for blockIdx := 0; blockIdx < numBlocks; blockIdx++ {
+	for blockIdx := range numBlocks {
 		block := NewBlockState(blockSize, maskTokenID)
 
 		err := DenoiseBlock(

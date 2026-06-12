@@ -30,11 +30,11 @@ type Model struct {
 
 // DiffusionOptions holds diffusion-specific hyperparameters read from GGUF metadata.
 type DiffusionOptions struct {
-	BlockSize     int     // tokens per diffusion block (default 256)
-	EBMaxSteps    int     // maximum denoising iterations per block (default 48)
-	EntropyBound  float64 // entropy threshold for unmasking (default 0.1)
-	MaskTokenID   int32   // token ID used for [MASK]
-	NumVocab      int     // vocabulary size
+	BlockSize    int     // tokens per diffusion block (default 256)
+	EBMaxSteps   int     // maximum denoising iterations per block (default 48)
+	EntropyBound float64 // entropy threshold for unmasking (default 0.1)
+	MaskTokenID  int32   // token ID used for [MASK]
+	NumVocab     int     // vocabulary size
 }
 
 func New(c fs.Config) (model.Model, error) {

@@ -19,11 +19,11 @@ const (
 // TextOptions holds transformer backbone configuration, reusing the Gemma4 MoE
 // layout with additions for diffusion-specific per-block timestep embedding.
 type TextOptions struct {
-	hiddenSize           int
-	numHeads, numKVHeads int
-	numGlobalKVHeads     int
+	hiddenSize             int
+	numHeads, numKVHeads   int
+	numGlobalKVHeads       int
 	headDim, globalHeadDim int
-	hiddenLayers         int
+	hiddenLayers           int
 
 	eps               float32
 	ropeBase          float32
@@ -298,10 +298,10 @@ type TextLayer struct {
 	PostMLPNorm       *nn.RMSNorm `gguf:"post_ffw_norm,alt:ffn_post_norm"`
 
 	// MoE (present only when experts are configured)
-	Router      *TextRouter
-	MoE         *TextMoEBlock
-	MoENorm     *nn.RMSNorm `gguf:"pre_ffw_norm_2,alt:ffn_pre_norm_2"`
-	PostMoENorm *nn.RMSNorm `gguf:"post_ffw_norm_2,alt:ffn_post_norm_2"`
+	Router       *TextRouter
+	MoE          *TextMoEBlock
+	MoENorm      *nn.RMSNorm `gguf:"pre_ffw_norm_2,alt:ffn_pre_norm_2"`
+	PostMoENorm  *nn.RMSNorm `gguf:"post_ffw_norm_2,alt:ffn_post_norm_2"`
 	PostMLPNorm1 *nn.RMSNorm `gguf:"post_ffw_norm_1,alt:ffn_post_norm_1"`
 }
 
