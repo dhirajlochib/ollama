@@ -130,3 +130,91 @@ func TestDepthControllerAcceptanceInherit(t *testing.T) {
 		t.Fatalf("acceptance(3) = %v, want 0 (inherited)", a)
 	}
 }
+
+func TestSelectSpecModeDFlashSampleOnTemperature(t *testing.T) {
+	r := &Runner{Model: stubDFlashTarget{}, Draft: stubDFlashDraft{}}
+	mode, _ := r.selectSpecMode(sampler.Options{Temperature: 0.7})
+	if mode != SpecModeDFlashSample {
+		t.Fatalf("mode = %v, want dflash_sample", mode)
+	}
+}
+
+func TestSelectSpecModeDFlashSampleOnRepeatPenalty(t *testing.T) {
+	r := &Runner{Model: stubDFlashTarget{}, Draft: stubDFlashDraft{}}
+	mode, _ := r.selectSpecMode(sampler.Options{
+		Temperature:   0,
+		RepeatLastN:   64,
+		RepeatPenalty: 1.1,
+	})
+	if mode != SpecModeDFlashSample {
+		t.Fatalf("mode = %v, want dflash_sample with repeat penalty", mode)
+	}
+}
+
+func TestSelectSpecModeMTPWhenOnlyMTP(t *testing.T) {
+	r := &Runner{Model: stubEmbedModel{}, Draft: stubMTPDraft{}}
+	// useGreedyMTP also requires Draft as MTPDraftModel and neutral sampler — temperature 0 with neutrals.
+	mode, reason := r.selectSpecMode(sampler.Options{Temperature: 0})
+	if mode != SpecModeMTPGreedy {
+		t.Fatalf("mode = %v (%s), want mtp_greedy", mode, reason)
+	}
+}
+
+func TestSelectSpecModeNoneWithoutDraft(t *testing.T) {
+	r := &Runner{Model: stubDFlashTarget{}, Draft: nil}
+	mode, reason := r.selectSpecMode(sampler.Options{})
+	if mode != SpecModeNone || reason != "no_compatible_draft" {
+		t.Fatalf("mode=%v reason=%q", mode, reason)
+	}
+}
+
+func TestSpecModeString(t *testing.T) {
+	if SpecModeNone.String() != "none" {
+		t.Fatal(SpecModeNone.String())
+	}
+	if SpecModeDFlashGreedy.String() != "dflash_greedy" {
+		t.Fatal(SpecModeDFlashGreedy.String())
+	}
+}
+
+func TestDepthControllerNextWithinFrontierWindow(t *testing.T) {
+	c := newDepthController()
+	for range 10 {
+		c.observe(2, 2, 1.0)
+	}
+	maxAllowed := c.frontier() + 1
+	for range depthProbeInterval + 5 {
+		n := c.next()
+		if n < 0 || n > maxAllowed {
+			t.Fatalf("next()=%d outside [0, frontier+1=%d]", n, maxAllowed)
+		}
+	}
+	// selected itself must also sit in that window.
+	if sel := c.selected(); sel < 0 || sel > maxAllowed {
+		t.Fatalf("selected=%d outside [0, %d]", sel, maxAllowed)
+	}
+}
+
+func TestDepthControllerZeroDepthWhenExpensive(t *testing.T) {
+	c := newDepthController()
+	// Deep drafts cost 10x with poor acceptance — should prefer depth 0.
+	for range 30 {
+		c.observe(0, 0, 1.0)
+		c.observe(4, 0, 10.0) // never accepts, very expensive
+	}
+	if sel := c.selected(); sel != 0 {
+		t.Fatalf("selected = %d, want 0 when deep drafts never accept", sel)
+	}
+}
+
+func TestDepthCommittedFormula(t *testing.T) {
+	c := newDepthController()
+	// Manually seed acceptance rates: pos1=1.0, pos2=0.5 via observations.
+	c.observe(2, 1, 1.0) // tries: pos1 hit, pos2 miss
+	// acceptance(1)=1, acceptance(2)=0
+	// committed(2) = 1 + 1*1 + 1*1*0 = 2
+	got := c.committed(2)
+	if got != 2.0 {
+		t.Fatalf("committed(2) = %v, want 2", got)
+	}
+}
