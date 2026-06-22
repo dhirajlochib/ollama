@@ -97,6 +97,38 @@ func TestParseConfigMinimalOK(t *testing.T) {
 	}
 }
 
+func TestParseConfigZLabNestedBlockSize(t *testing.T) {
+	// Mirrors z-lab/Qwen3.5-4B-DFlash config shape (block_size inside dflash_config).
+	data := []byte(`{
+		"architectures": ["DFlashDraftModel"],
+		"hidden_size": 2560,
+		"num_hidden_layers": 6,
+		"num_attention_heads": 32,
+		"num_key_value_heads": 8,
+		"head_dim": 128,
+		"intermediate_size": 9216,
+		"vocab_size": 248320,
+		"num_target_layers": 32,
+		"sliding_window": 4096,
+		"layer_types": ["sliding_attention","sliding_attention","sliding_attention","sliding_attention","sliding_attention","full_attention"],
+		"dflash_config": {
+			"block_size": 16,
+			"mask_token_id": 248077,
+			"target_layer_ids": [1, 5, 9, 13, 17, 21, 25, 29]
+		}
+	}`)
+	cfg, err := parseConfig(data)
+	if err != nil {
+		t.Fatalf("parseConfig z-lab shape: %v", err)
+	}
+	if cfg.BlockSizeValue != 16 {
+		t.Fatalf("BlockSizeValue = %d, want 16 from nested dflash_config", cfg.BlockSizeValue)
+	}
+	if len(cfg.DFlash.TargetLayerIDs) != 8 {
+		t.Fatalf("target layers = %v", cfg.DFlash.TargetLayerIDs)
+	}
+}
+
 func TestParseConfigSlidingRequiresWindow(t *testing.T) {
 	data := []byte(`{
 		"hidden_size": 256,

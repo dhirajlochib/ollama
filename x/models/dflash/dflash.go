@@ -42,8 +42,9 @@ type Config struct {
 	SlidingWindow         int32              `json:"sliding_window"`
 	FinalLogitSoftcapping *float32           `json:"final_logit_softcapping"`
 	DFlash                struct {
-		TargetLayerIDs []int `json:"target_layer_ids"`
-		MaskTokenID    int32 `json:"mask_token_id"`
+		TargetLayerIDs []int  `json:"target_layer_ids"`
+		MaskTokenID    int32  `json:"mask_token_id"`
+		BlockSize      int32  `json:"block_size"` // HF/z-lab configs often nest block_size here
 	} `json:"dflash_config"`
 
 	QuantGroupSize int                               `json:"-"`
@@ -129,6 +130,10 @@ func parseConfig(data []byte) (Config, error) {
 	}
 	if cfg.RopeTheta == 0 {
 		cfg.RopeTheta = 1000000
+	}
+	// z-lab HF checkpoints store block_size under dflash_config; accept either location.
+	if cfg.BlockSizeValue <= 0 && cfg.DFlash.BlockSize > 0 {
+		cfg.BlockSizeValue = cfg.DFlash.BlockSize
 	}
 	if cfg.BlockSizeValue <= 0 {
 		return Config{}, fmt.Errorf("invalid block_size: %d", cfg.BlockSizeValue)
