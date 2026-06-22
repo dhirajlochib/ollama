@@ -57,6 +57,61 @@ type MTPEmbeddingModel interface {
 	TokenEmbeddings(inputIDs *mlx.Array) *mlx.Array
 }
 
+// DFlashTargetModel exposes target-layer hidden states for DFlash drafts.
+// layerIDs selects intermediate activations (sorted ascending) concatenated
+// along the feature axis for draft KV injection.
+type DFlashTargetModel interface {
+	ForwardDFlash(b *batch.Batch, caches []cache.Cache, layerIDs []int) (hidden, targetHidden *mlx.Array)
+}
+
+// DFlashDraftModel is a block-diffusion speculative draft model (DFlash).
+// Unlike autoregressive MTP heads, it proposes an entire draft block in one
+// non-causal forward pass conditioned on injected target context features.
+type DFlashDraftModel interface {
+	DraftModel
+
+	TargetLayerIDs() []int
+	BlockSize() int
+	MaskTokenID() int32
+	NewCaches() []cache.Cache
+	// AppendContext injects target hidden states into the draft KV caches.
+	AppendContext(targetHidden *mlx.Array, caches []cache.Cache)
+	// Draft runs the block-diffusion drafter over inputIDs (anchor + masks)
+	// and returns logits for the full block.
+	Draft(inputIDs *mlx.Array, caches []cache.Cache) *mlx.Array
+}
+
+// SpecKind classifies the draft strategy available on a loaded Runner.
+type SpecKind int
+
+const (
+	SpecKindNone SpecKind = iota
+	SpecKindMTP
+	SpecKindDFlash
+)
+
+// DetectSpecKind inspects target+draft capabilities and returns the
+// speculative strategy the runner should use. DFlash takes precedence when
+// both are present (separate draft package with its own caches).
+func DetectSpecKind(target Model, draft DraftModel) SpecKind {
+	if draft == nil {
+		return SpecKindNone
+	}
+	if _, ok := draft.(DFlashDraftModel); ok {
+		if _, ok := target.(DFlashTargetModel); ok {
+			if _, ok := target.(MTPEmbeddingModel); ok {
+				return SpecKindDFlash
+			}
+		}
+	}
+	if _, ok := draft.(MTPDraftModel); ok {
+		if _, ok := target.(MTPEmbeddingModel); ok {
+			return SpecKindMTP
+		}
+	}
+	return SpecKindNone
+}
+
 var (
 	mu            sync.Mutex
 	registry      = make(map[string]func(root *model.Root) (Model, error))

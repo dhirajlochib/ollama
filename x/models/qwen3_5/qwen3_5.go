@@ -1310,24 +1310,49 @@ func (l *Layer) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, positions *
 }
 
 func (m *Model) Forward(b *batch.Batch, caches []cache.Cache) *mlx.Array {
+	out, _ := m.forward(b, caches, nil)
+	return out
+}
+
+// ForwardDFlash runs the normal target forward while capturing intermediate
+// activations at the requested layer IDs (sorted ascending). Captured states
+// are concatenated on the feature axis for DFlash draft KV injection.
+func (m *Model) ForwardDFlash(b *batch.Batch, caches []cache.Cache, layerIDs []int) (hidden, targetHidden *mlx.Array) {
+	return m.forward(b, caches, layerIDs)
+}
+
+func (m *Model) forward(b *batch.Batch, caches []cache.Cache, captureLayerIDs []int) (*mlx.Array, *mlx.Array) {
 	dims := b.InputIDs.Dims()
 	B, L := int32(dims[0]), int32(dims[1])
 	positions := mlx.FromValues(b.SeqOffsets, len(b.SeqOffsets))
 
 	h := m.EmbedTokens.Forward(b.InputIDs)
+	captured := make([]*mlx.Array, 0, len(captureLayerIDs))
+	nextCapture := 0
 	for i, layer := range m.Layers {
 		var c cache.Cache
 		if caches != nil && i < len(caches) {
 			c = caches[i]
 		}
 		h = layer.Forward(h, b, c, positions, B, L, m.Config)
+		if nextCapture < len(captureLayerIDs) && i == captureLayerIDs[nextCapture] {
+			captured = append(captured, h)
+			nextCapture++
+		}
 	}
 	out := m.Norm.Forward(h, m.RMSNormEps)
-	return out
+	if len(captured) == 0 {
+		return out, nil
+	}
+	return out, mlx.Concatenate(captured, -1)
 }
 
 func (m *Model) Unembed(x *mlx.Array) *mlx.Array {
 	return m.LMHead.Forward(x)
+}
+
+func (m *Model) TokenEmbeddings(inputIDs *mlx.Array) *mlx.Array {
+	return m.EmbedTokens.Forward(inputIDs)
 }
 
 func (m *Model) NumLayers() int {

@@ -13,6 +13,7 @@ import (
 	"github.com/ollama/ollama/logutil"
 	"github.com/ollama/ollama/x/mlxrunner/batch"
 	"github.com/ollama/ollama/x/mlxrunner/mlx"
+	"github.com/ollama/ollama/x/mlxrunner/model/base"
 	sampler "github.com/ollama/ollama/x/mlxrunner/sample"
 	"github.com/ollama/ollama/x/tokenizer"
 )
@@ -137,11 +138,26 @@ func (r *Runner) TextGenerationPipeline(ctx context.Context, request Request) er
 
 	// Register the sampler after prefill completes.
 	r.Sampler.Add(pipelineSlot, request.SamplerOpts, inputs)
-	if r.useGreedyMTP(request.SamplerOpts) {
+
+	// Speculative decoding priority: DFlash (block diffusion) > MTP (AR heads) > plain.
+	specMode, specReason := r.selectSpecMode(request.SamplerOpts)
+	switch specMode {
+	case SpecModeDFlashGreedy, SpecModeDFlashSample:
+		dflashDraft := r.Draft.(base.DFlashDraftModel)
+		draftCaches := dflashDraft.NewCaches()
+		defer freeCacheSet(draftCaches)
+		if specMode == SpecModeDFlashGreedy {
+			return r.runGreedyDFlashDecode(ctx, request, session, caches, draftCaches, tokens[processed:], &position, now)
+		}
+		return r.runSampleDFlashDecode(ctx, request, session, caches, draftCaches, tokens[processed:], &position, now)
+	case SpecModeMTPGreedy:
 		return r.runGreedyMTPDecode(ctx, request, session, caches, tokens[processed:], &position, now)
-	}
-	if r.useSampleMTP(request.SamplerOpts) {
+	case SpecModeMTPSample:
 		return r.runSampleMTPDecode(ctx, request, session, caches, tokens[processed:], &position, now)
+	default:
+		if r.Draft != nil && !specMode.Enabled() {
+			slog.Info("speculative decode disabled", "reason", specReason, "spec_mode", specMode.String())
+		}
 	}
 
 	step := func(token *mlx.Array) sampler.Result {
